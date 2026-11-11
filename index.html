@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="mn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TouchDesigner POV камер</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Unbounded:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Layout idea: one full-screen operator network; caption floats on top, controls sit on the bottom edge like a timeline bar. */
+:root {
+  color-scheme: dark;
+  --pane: #0e0e14;        /* network background */
+  --panel: #17171f;       /* bars and buttons */
+  --edge: #34343f;        /* borders, wires */
+  --text: #f1f1f4;
+  --muted: #8c8c9a;
+  --lime: #9bff1e;        /* threshold operator */
+  --blue: #2f55ff;        /* lookup operator */
+  --font-display: "Unbounded", "Trebuchet MS", "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--pane);
+  color: var(--text);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  -webkit-user-select: none; user-select: none;
+}
+#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+#caption {
+  position: fixed; top: 0; left: 0; right: 0;
+  padding: 18px 16px 0;
+  text-align: center;
+  pointer-events: none;
+}
+#caption span {
+  display: inline-block;
+  pointer-events: auto;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: clamp(15px, 4.4vw, 26px);
+  line-height: 1.35;
+  text-wrap: balance;
+  max-width: 22ch;
+  padding: 2px 8px;
+  border-radius: 6px;
+  outline: none;
+  -webkit-user-select: text; user-select: text;
+  cursor: text;
+}
+#caption span:focus-visible { box-shadow: 0 0 0 2px var(--lime); }
+#bar {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px 16px 14px;
+  background: linear-gradient(to top, rgba(14,14,20,.96) 70%, rgba(14,14,20,0));
+}
+#btns { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+button, .filebtn {
+  font: 600 13px/1 var(--font-mono);
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  padding: 11px 14px;
+  cursor: pointer;
+}
+button.primary { background: var(--lime); color: #0b1400; border-color: var(--lime); }
+button:focus-visible, .filebtn:focus-within { outline: 2px solid var(--lime); outline-offset: 2px; }
+button[hidden] { display: none; }
+.filebtn { position: relative; overflow: hidden; }
+.filebtn input { position: absolute; inset: 0; opacity: 0; cursor: pointer; font-size: 0; }
+#msg {
+  margin: 0; text-align: center;
+  font-size: 11.5px; line-height: 1.45; color: var(--muted);
+  min-height: 1.45em;
+}
+#msg.warn { color: #ffd166; }
+video { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" aria-label="Камерын дүрсийг TouchDesigner маягийн сүлжээгээр харуулах талбар"></canvas>
+
+<div id="caption"><span id="captionText" contenteditable="true" spellcheck="false" role="textbox" aria-label="Гарчиг">POV: чи TouchDesigner дотор амьдардаг</span></div>
+
+<div id="bar">
+  <div id="btns">
+    <button id="camBtn" class="primary" type="button">Камер асаах</button>
+    <button id="flipBtn" type="button" hidden>Камер солих</button>
+    <label class="filebtn">Видео сонгох<input id="fileIn" type="file" accept="video/*"></label>
+  </div>
+  <p id="msg">Жишээ дүрс тоглож байна. Цонхнуудыг чирж зөөнө, жижиг цонхон дээр дарвал том дэлгэцэд гарна.</p>
+</div>
+
+<video id="vid" playsinline muted loop></video>
+
+<script>
+(function () {
+  "use strict";
+  var SW = 160, SH = 120, N = SW * SH;            // working frame, 4:3
+  var stage = document.getElementById("stage");
+  var ctx = stage.getContext("2d");
+  var video = document.getElementById("vid");
+  var camBtn = document.getElementById("camBtn");
+  var flipBtn = document.getElementById("flipBtn");
+  var fileIn = document.getElementById("fileIn");
+  var msgEl = document.getElementById("msg");
+  var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  var work = document.createElement("canvas"); work.width = SW; work.height = SH;
+  var wctx = work.getContext("2d", { willReadFrequently: true });
+
+  function makeBuf() {
+    var c = document.createElement("canvas"); c.width = SW; c.height = SH;
+    var x = c.getContext("2d");
+    return { c: c, x: x, img: x.createImageData(SW, SH) };
+  }
+  var bufGray = makeBuf(), bufLime = makeBuf(), bufBlue = makeBuf();
+  var luma = new Float32Array(N), prev = new Float32Array(N);
+  var lo = 0, hi = 1;
+
+  var mode = "demo";          // demo | cam | file
+  var facing = "user", mirror = false, stream = null, fileUrl = null;
+  var W = 0, H = 0, dpr = 1;
+  var track = { x: SW / 2, y: SH / 2, a: 0 };
+
+  // Operators. Names follow TouchDesigner's default TOP names.
+  var nodes = [
+    { id: "in",   label: "videodevicein1", src: work,       x: 0, y: 0, w: 0, h: 0 },
+    { id: "gray", label: "monochrome1",    src: bufGray.c,  x: 0, y: 0, w: 0, h: 0 },
+    { id: "lime", label: "threshold1",     src: bufLime.c,  x: 0, y: 0, w: 0, h: 0 },
+    { id: "blue", label: "lookup1",        src: bufBlue.c,  x: 0, y: 0, w: 0, h: 0 },
+    { id: "out",  label: "out1",           src: null,       x: 0, y: 0, w: 0, h: 0, big: true }
+  ];
+  var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
+  var wires = [["in", "gray"], ["gray", "lime"], ["gray", "blue"]];
+  var selected = "blue";
+  var userMoved = false;
+
+  function say(text, warn) { msgEl.textContent = text; msgEl.className = warn ? "warn" : ""; }
+
+  /* ---------- layout ---------- */
+  function layout() {
+    var top = Math.min(120, H * 0.17), bottom = H - 118, avail = Math.max(120, bottom - top);
+    var out = byId.out, tw, th;
+    if (W < H) {                                   // phone: operators on top, viewer below
+      tw = W * 0.27; th = tw * 0.75;
+      place("in",   W * 0.04,  top + 10, tw, th);
+      place("gray", W * 0.365, top,      tw, th);
+      place("lime", W * 0.69,  top + 10, tw, th);
+      place("blue", W * 0.365, top + th + 34, tw, th);
+      var vy = top + th * 2 + 76;
+      var vh = Math.max(90, bottom - vy - 18);
+      var vw = Math.min(W * 0.92, vh * 4 / 3); vh = vw * 0.75;
+      place("out", (W - vw) / 2, vy, vw, vh);
+    } else {                                       // wide: operators left, viewer right
+      tw = Math.min(W * 0.13, avail * 0.34); th = tw * 0.75;
+      var x0 = W * 0.03, x1 = x0 + tw * 1.55;
+      place("in",   x0, top + avail * 0.38, tw, th);
+      place("gray", x1, top + avail * 0.04, tw, th);
+      place("blue", x1, top + avail * 0.38, tw, th);
+      place("lime", x1, top + avail * 0.72, tw, th);
+      var ox = x1 + tw * 1.7;
+      var oh = avail * 0.9, ow = Math.min(oh * 4 / 3, W - ox - W * 0.03); oh = ow * 0.75;
+      place("out", W - ow - W * 0.03, top + (avail - oh) / 2, ow, oh);
+    }
+    void out;
+  }
+  function place(id, x, y, w, h) { var n = byId[id]; n.x = x; n.y = y; n.w = w; n.h = h; }
+
+  function resize() {
+    var oldW = W, oldH = H;
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    stage.width = Math.round(W * dpr); stage.height = Math.round(H * dpr);
+    if (!userMoved || !oldW) layout();
+    else nodes.forEach(function (n) {              // keep dragged nodes on screen
+      n.x = Math.max(0, Math.min(W - n.w, n.x * W / oldW));
+      n.y = Math.max(0, Math.min(H - n.h, n.y * H / oldH));
+    });
+  }
+  window.addEventListener("resize", resize);
+
+  /* ---------- sources ---------- */
+  function drawDemo(t) {
+    var s = reduceMotion ? 1.2 : t / 1000;
+    wctx.fillStyle = "#050508"; wctx.fillRect(0, 0, SW, SH);
+    function blob(x, y, rx, ry, v) {
+      var g = wctx.createRadialGradient(x, y - ry * 0.2, 1, x, y, Math.max(rx, ry));
+      g.addColorStop(0, "rgba(" + v + "," + v + "," + v + ",1)");
+      g.addColorStop(0.75, "rgba(" + (v * 0.45 | 0) + "," + (v * 0.45 | 0) + "," + (v * 0.45 | 0) + ",1)");
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      wctx.fillStyle = g; wctx.beginPath(); wctx.ellipse(x, y, rx, ry, 0, 0, 6.2832); wctx.fill();
+    }
+    var sway = Math.sin(s * 0.9) * 5;
+    blob(80 + sway, 112, 46, 44, 150);                                   // shoulders
+    blob(80 + sway * 1.3, 52 + Math.sin(s * 1.7) * 2, 20, 25, 235);      // head
+    blob(126 + Math.sin(s * 2.3) * 10, 46 + Math.cos(s * 1.9) * 16, 11, 14, 250);  // right hand
+    blob(32 + Math.cos(s * 1.4) * 8, 70 + Math.sin(s * 2.1) * 20, 10, 13, 240);    // left hand
+  }
+
+  function grab(t) {
+    if (mode !== "demo" && video.readyState >= 2 && video.videoWidth) {
+      var vw = video.videoWidth, vh = video.videoHeight;
+      var s = Math.max(SW / vw, SH / vh), dw = vw * s, dh = vh * s;
+      wctx.save();
+      if (mirror) { wctx.translate(SW, 0); wctx.scale(-1, 1); }
+      wctx.drawImage(video, (SW - dw) / 2, (SH - dh) / 2, dw, dh);
+      wctx.restore();
+    } else {
+      drawDemo(t);
+    }
+  }
+
+  function stopStream() {
+    if (stream) { stream.getTracks().forEach(function (tr) { tr.stop(); }); stream = null; }
+  }
+
+  function startCam() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      say("Энэ хөтөч камер нээж чадахгүй байна. Видео сонгох товчоор бичлэгээ оруулна уу.", true);
+      return;
+    }
+    stopStream();
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false
+    }).then(function (st) {
+      stream = st;
+      if (fileUrl) { URL.revokeObjectURL(fileUrl); fileUrl = null; }
+      video.removeAttribute("src");
+      video.srcObject = st;
+      mirror = facing === "user";
+      mode = "cam";
+      camBtn.textContent = "Камер унтраах"; camBtn.classList.remove("primary");
+      flipBtn.hidden = false;
+      say("Камер ажиллаж байна. Гараа хөдөлгөөд үзээрэй.");
+      return video.play();
+    }).catch(function (err) {
+      var denied = err && (err.name === "NotAllowedError" || err.name === "SecurityError");
+      say(denied
+        ? "Камерын зөвшөөрөл олгогдсонгүй. Claude дотор нээсэн хуудсанд камер хаалттай байдаг тул Видео сонгох товчоор бичлэгээ оруулна уу."
+        : "Камер нээгдсэнгүй. Өөр програм ашиглаж байгаа эсэхийг шалгаад дахин оролдоно уу, эсвэл видео сонгоно уу.", true);
+    });
+  }
+
+  function stopCam() {
+    stopStream(); video.srcObject = null; mode = "demo";
+    camBtn.textContent = "Камер асаах"; camBtn.classList.add("primary");
+    flipBtn.hidden = true;
+    say("Жишээ дүрс тоглож байна.");
+  }
+
+  camBtn.addEventListener("click", function () { if (mode === "cam") stopCam(); else startCam(); });
+  flipBtn.addEventListener("click", function () { facing = facing === "user" ? "environment" : "user"; startCam(); });
+
+  fileIn.addEventListener("change", function () {
+    var f = fileIn.files && fileIn.files[0];
+    if (!f) return;
+    stopStream(); video.srcObject = null;
+    if (fileUrl) URL.revokeObjectURL(fileUrl);
+    fileUrl = URL.createObjectURL(f);
+    video.src = fileUrl; video.loop = true; video.muted = true;
+    mirror = false; mode = "file";
+    camBtn.textContent = "Камер асаах"; camBtn.classList.add("primary");
+    flipBtn.hidden = true;
+    var p = video.play();
+    if (p && p.catch) p.catch(function () {
+      say("Энэ видеог тоглуулж чадсангүй. MP4 форматтай өөр бичлэг сонгоно уу.", true);
+    });
+    say("Таны видео тоглож байна.");
+    fileIn.value = "";
+  });
+  video.addEventListener("error", function () {
+    if (mode === "file") { mode = "demo"; say("Энэ видеог уншиж чадсангүй. MP4 форматтай өөр бичлэг сонгоно уу.", true); }
+  });
+
+  /* ---------- per-frame image processing ---------- */
+  function process() {
+    var d = wctx.getImageData(0, 0, SW, SH).data;
+    var g = bufGray.img.data, l = bufLime.img.data, b = bufBlue.img.data;
+    var mn = 1, mx = 0, i, p, v;
+    for (i = 0, p = 0; i < N; i++, p += 4) {
+      v = (d[p] * 0.299 + d[p + 1] * 0.587 + d[p + 2] * 0.114) / 255;
+      if (v < mn) mn = v; if (v > mx) mx = v;
+      luma[i] = v;
+    }
+    lo += (mn - lo) * 0.08; hi += (Math.max(mx, mn + 0.15) - hi) * 0.08;   // slow auto-levels
+    var span = Math.max(0.15, hi - lo);
+    var sx = 0, sy = 0, mass = 0, x = 0, y = 0, k, q, dv;
+    for (i = 0, p = 0; i < N; i++, p += 4) {
+      v = (luma[i] - lo) / span; if (v < 0) v = 0; else if (v > 1) v = 1;
+      dv = v - prev[i]; if (dv < 0) dv = -dv;
+      if (dv > 0.14) { sx += x * dv; sy += y * dv; mass += dv; }
+      prev[i] = v; luma[i] = v;
+
+      q = v * 255 | 0;                                   // monochrome
+      g[p] = q; g[p + 1] = q; g[p + 2] = q; g[p + 3] = 255;
+
+      k = (v - 0.3) / 0.14; if (k < 0) k = 0; else if (k > 1) k = 1;     // threshold: subject black on lime
+      k = 1 - k;
+      l[p] = 155 * k; l[p + 1] = 255 * k; l[p + 2] = 30 * k; l[p + 3] = 255;
+
+      if (v < 0.6) {                                     // lookup: navy -> blue -> pale
+        k = v / 0.6;
+        b[p] = 10 + 30 * k; b[p + 1] = 6 + 64 * k; b[p + 2] = 46 + 209 * k;
+      } else {
+        k = (v - 0.6) / 0.4;
+        b[p] = 40 + 150 * k; b[p + 1] = 70 + 145 * k; b[p + 2] = 255;
+      }
+      b[p + 3] = 255;
+
+      if (++x === SW) { x = 0; y++; }
+    }
+    bufGray.x.putImageData(bufGray.img, 0, 0);
+    bufLime.x.putImageData(bufLime.img, 0, 0);
+    bufBlue.x.putImageData(bufBlue.img, 0, 0);
+
+    if (mass > 6) {
+      track.x += (sx / mass - track.x) * 0.3; track.y += (sy / mass - track.y) * 0.3;
+      track.a = Math.min(1, track.a + 0.2);
+    } else {
+      track.a = Math.max(0, track.a - 0.03);
+    }
+  }
+
+  /* ---------- drawing ---------- */
+  function ghost() {
+    // Subject as displaced horizontal lines across the whole pane, three offset colour passes.
+    var s = Math.max(W / SW, H / SH), ox = (W - SW * s) / 2, oy = (H - SH * s) / 2;
+    var amp = s * 5, passes = [[-1.5, "rgba(255,70,130,0.30)"], [0, "rgba(130,255,170,0.24)"], [1.5, "rgba(90,140,255,0.36)"]];
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.lineWidth = 1;
+    for (var c = 0; c < 3; c++) {
+      var dx = passes[c][0];
+      ctx.strokeStyle = passes[c][1];
+      ctx.beginPath();
+      for (var j = 0; j < SH; j++) {
+        var row = j * SW, pen = false, by = oy + (j + 0.5) * s + dx * 0.6;
+        if (by < -amp || by > H + amp) continue;
+        for (var i = 0; i < SW; i += 2) {
+          var v = luma[row + i];
+          if (v < 0.14) { pen = false; continue; }
+          var px = ox + i * s + dx, py = by - v * amp;
+          if (pen) ctx.lineTo(px, py); else { ctx.moveTo(px, py); pen = true; }
+        }
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function wire(a, b, strong) {
+    var x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2;
+    var k = Math.max(30, Math.abs(x2 - x1) * 0.5);
+    ctx.beginPath(); ctx.moveTo(x1, y1);
+    ctx.bezierCurveTo(x1 + k, y1, x2 - k, y2, x2, y2);
+    ctx.strokeStyle = strong ? "rgba(241,241,244,0.75)" : "rgba(140,140,154,0.55)";
+    ctx.lineWidth = strong ? 1.4 : 1;
+    ctx.stroke();
+    ctx.fillStyle = strong ? "#f1f1f4" : "#8c8c9a";
+    ctx.beginPath(); ctx.arc(x1, y1, 2.5, 0, 6.2832); ctx.arc(x2, y2, 2.5, 0, 6.2832); ctx.fill();
+  }
+
+  function drawNode(n) {
+    var src = n.big ? byId[selected].src : n.src;
+    ctx.fillStyle = "#07070b"; ctx.fillRect(n.x - 3, n.y - 3, n.w + 6, n.h + 6);
+    ctx.drawImage(src, n.x, n.y, n.w, n.h);
+    if (n.big) {
+      ctx.fillStyle = "rgba(0,0,8,0.38)";                           // scanlines
+      for (var y = n.y; y < n.y + n.h; y += 3) ctx.fillRect(n.x, y, n.w, 1);
+      if (track.a > 0.02) {
+        var tx = n.x + track.x / SW * n.w, ty = n.y + track.y / SH * n.h, r = Math.max(7, n.w * 0.028);
+        ctx.strokeStyle = "rgba(255,255,255," + (0.9 * track.a) + ")"; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(tx, ty, r, 0, 6.2832); ctx.stroke();
+        ctx.fillStyle = "rgba(255,255,255," + track.a + ")";
+        ctx.beginPath(); ctx.arc(tx, ty + r * 2.1, 1.6, 0, 6.2832); ctx.fill();
+      }
+    }
+    var sel = n.big || n.id === selected;
+    ctx.strokeStyle = n.big ? "#f1f1f4" : (n.id === selected ? "#9bff1e" : "#4a4a58");
+    ctx.lineWidth = sel ? 2 : 1;
+    ctx.strokeRect(n.x - 3, n.y - 3, n.w + 6, n.h + 6);
+    ctx.fillStyle = sel ? "#d6d6de" : "#8c8c9a";
+    ctx.font = (n.big ? 11 : 9.5) + "px ui-monospace, Menlo, Consolas, monospace";
+    ctx.textBaseline = "top";
+    ctx.fillText(n.label, n.x - 3, n.y + n.h + 7);
+  }
+
+  var frames = 0, fps = 60, lastFps = 0, frameNo = 0;
+  function draw(t) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#0e0e14"; ctx.fillRect(0, 0, W, H);
+    ghost();
+    wires.forEach(function (w) { wire(byId[w[0]], byId[w[1]], false); });
+    wire(byId[selected], byId.out, true);
+    nodes.forEach(drawNode);
+
+    // timeline readout, as in the bottom bar of the TouchDesigner editor
+    var sec = t / 1000, mm = Math.floor(sec / 60), ss = Math.floor(sec % 60), ff = Math.floor((sec % 1) * 60);
+    function z(n) { return (n < 10 ? "0" : "") + n; }
+    ctx.fillStyle = "#6c6c7a"; ctx.font = "10px ui-monospace, Menlo, Consolas, monospace"; ctx.textBaseline = "bottom";
+    ctx.fillText("00:" + z(mm) + ":" + z(ss) + "." + z(ff) + "   f " + frameNo + "   " + fps + " fps", 16, H - 104);
+  }
+
+  function loop(t) {
+    requestAnimationFrame(loop);
+    frames++; frameNo = (frameNo + 1) % 600;
+    if (t - lastFps > 1000) { fps = Math.round(frames * 1000 / (t - lastFps)); frames = 0; lastFps = t; }
+    grab(t); process(); draw(t);
+  }
+
+  /* ---------- dragging and selecting ---------- */
+  var drag = null;
+  function hit(x, y) {
+    for (var i = nodes.length - 1; i >= 0; i--) {
+      var n = nodes[i];
+      if (x >= n.x - 8 && x <= n.x + n.w + 8 && y >= n.y - 8 && y <= n.y + n.h + 20) return n;
+    }
+    return null;
+  }
+  stage.addEventListener("pointerdown", function (e) {
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    var n = hit(e.clientX, e.clientY);
+    if (!n) return;
+    drag = { n: n, dx: e.clientX - n.x, dy: e.clientY - n.y, sx: e.clientX, sy: e.clientY, moved: false };
+    try { stage.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  stage.addEventListener("pointermove", function (e) {
+    if (!drag) return;
+    if (!drag.moved && Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) < 6) return;
+    drag.moved = true; userMoved = true;
+    drag.n.x = Math.max(0, Math.min(W - drag.n.w, e.clientX - drag.dx));
+    drag.n.y = Math.max(0, Math.min(H - drag.n.h, e.clientY - drag.dy));
+  });
+  function endDrag() {
+    if (drag && !drag.moved && !drag.n.big) selected = drag.n.id;
+    drag = null;
+  }
+  stage.addEventListener("pointerup", endDrag);
+  stage.addEventListener("pointercancel", function () { drag = null; });
+
+  document.getElementById("captionText").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); e.target.blur(); }
+  });
+
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
