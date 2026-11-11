@@ -451,6 +451,8 @@ video { display: none; }
 
   resize();
   requestAnimationFrame(loop);
+  // Ask for the camera as soon as the page opens; the demo keeps playing if it is refused.
+  if (location.protocol === "https:" && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) startCam();
 })();
 </script>
 </body>
