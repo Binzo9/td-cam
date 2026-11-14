@@ -33,7 +33,7 @@
 
 <div id="panel">
   <h1>Hand FX</h1>
-  <p>Камераа асаагаад хоёр гараа өргө. Эрхий, долоовор хурууны хооронд фильтрийн портал нээгдэнэ. Нэг гарынхаа хуруунуудыг нийлүүлэхэд фильтр солигдоно.</p>
+  <p>Камераа асаагаад гараа өргө. Таван хурууны үзүүрийн хооронд фильтрийн цонх нээгдэнэ. Нэг гарынхаа хуруунуудыг нийлүүлэхэд фильтр солигдоно.</p>
   <button id="start">Камер асаах</button>
   <button id="pick" class="ghost">Бичлэг сонгох</button>
   <p id="msg"></p>
@@ -41,9 +41,9 @@
 <div id="hint">Гараа камерт харуул</div>
 <div id="bar">
   <button id="style">Фильтр: Дулаан</button>
-  <button id="shape">Дүрс: Портал</button>
+  <button id="shape">Дүрс: Олон өнцөгт</button>
   <button id="flip">Камер эргүүлэх</button>
-  <button id="dots">Цэгүүд: унтраалттай</button>
+  <button id="dots">Цэгүүд: асаалттай</button>
   <button id="exit">✕ Гарах</button>
 </div>
 
@@ -61,7 +61,7 @@ const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,
   [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
 
 const RAINBOW = { levels: 7, spin: 2.0, speed: 50, edge: [255, 240, 60] };
-let showDots = false, landmarker = null, lastTime = -1;
+let showDots = true, landmarker = null, lastTime = -1;
 let stream = null, facing = "user", mirror = true, fileUrl = null, running = false, sizedFor = "";
 
 function hslToRgb(h, s, l) {
@@ -177,7 +177,7 @@ function hull(points) {
 }
 
 const SHAPES = ["Олон өнцөгт", "Дугуй", "Од", "Зүрх", "Портал"];
-let shapeIdx = 4;
+let shapeIdx = 0;
 
 function shapePath(tips, poly, wrists, middleTip) {
   ctx.beginPath();
@@ -284,7 +284,8 @@ async function loadTracker() {
   const { FilesetResolver, HandLandmarker } = await import(VISION);
   const files = await FilesetResolver.forVisionTasks(WASM);
   const make = delegate => HandLandmarker.createFromOptions(files, {
-    baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: "VIDEO", numHands: 2 });
+    baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: "VIDEO", numHands: 2,
+    minHandDetectionConfidence: 0.3, minHandPresenceConfidence: 0.3, minTrackingConfidence: 0.3 });
   try { landmarker = await make("GPU"); } catch { landmarker = await make("CPU"); }
 }
 
