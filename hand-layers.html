@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="mn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hand Layers</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0a0d; color: #f2eef5;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { max-width: 100%; max-height: 100%; display: none; }
+  video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  #panel { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 16px;
+    align-items: center; justify-content: center; text-align: center; padding: 24px; }
+  #panel h1 { font-size: 22px; margin: 0; font-weight: 600; }
+  #panel p { margin: 0; max-width: 330px; line-height: 1.5; color: #b9b1c2; font-size: 15px; }
+  button { font: inherit; border: 0; border-radius: 999px; padding: 14px 28px; font-weight: 600;
+    background: #e0284f; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: none; gap: 8px; flex-wrap: wrap;
+    justify-content: center; padding: 12px; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+  #bar button { padding: 10px 14px; font-size: 13px; background: rgba(20,18,24,.75);
+    border: 1px solid rgba(255,255,255,.25); }
+  #hint { position: fixed; top: max(14px, env(safe-area-inset-top)); left: 0; right: 0; text-align: center;
+    font-size: 14px; color: #fff; text-shadow: 0 1px 4px #000; display: none; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="out"></canvas></div>
+<video id="cam" playsinline muted autoplay></video>
+<input id="img" type="file" accept="image/*" hidden>
+
+<div id="panel">
+  <h1>Hand Layers</h1>
+  <p>Хоёр гараа өргөхөд долоовор хуруунуудын хооронд хүрээ үүснэ. Гараа нэг секунд хөдөлгөөнгүй барихад тэр хүрээнд давхарга "наагдана". Дараагийн наалт бүр өөр загвартай.</p>
+  <button id="start">Камер асаах</button>
+  <p id="msg"></p>
+</div>
+<div id="hint"></div>
+<div id="bar">
+  <button id="next">Дараагийнх: Пиксел</button>
+  <button id="place">Наах</button>
+  <button id="undo">Буцаах</button>
+  <button id="clear">Цэвэрлэх</button>
+  <button id="add">Зураг нэмэх</button>
+  <button id="flip">Камер эргүүлэх</button>
+  <button id="exit">✕</button>
+</div>
+
+<script type="module">
+const VISION = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const $ = id => document.getElementById(id);
+const video = $("cam"), out = $("out"), ctx = out.getContext("2d");
+const base = document.createElement("canvas"), bctx = base.getContext("2d");      // толин тусгалтай камерын кадр
+const tmp = document.createElement("canvas"), tctx = tmp.getContext("2d", { willReadFrequently: true });
+const DISPLAY = "Impact, 'Arial Narrow Bold', 'Arial Black', sans-serif";
+
+let landmarker = null, stream = null, facing = "user", mirror = true, running = false, sizedFor = "", lastTime = -1;
+
+// Давхаргын загварууд. Хэрэглэгчийн зураг нэмэхэд энэ жагсаалтад орно.
+const STYLES = [
+  { name: "Пиксел", draw: drawPixel },
+  { name: "Карт", draw: drawCard },
+  { name: "Улаан", draw: drawDuo },
+  { name: "Постер", draw: drawPoster },
+];
+let styleIdx = 0;
+const layers = [];            // { style, x, y, w, h } — зургийн талбайн хэмжээнд харьцуулсан (0..1)
+
+// Камерын r хэсгийг жижиг canvas руу хуулж пикселүүдийг нь буцаана
+function grab(r, tw) {
+  const W = base.width, H = base.height;
+  const th = Math.max(1, Math.round(tw * r.h / r.w));
+  tmp.width = tw; tmp.height = th;
+  tctx.drawImage(base, r.x, r.y, r.w, r.h, 0, 0, tw, th);
+  return tctx.getImageData(0, 0, tw, th);
+}
+
+const BLUES = [[18, 40, 120], [30, 107, 255], [150, 200, 250], [226, 240, 252]];
+function drawPixel(r) {
+  const img = grab(r, Math.max(8, Math.round(r.w / 9))), d = img.data;
+  for (let p = 0; p < d.length; p += 4) {
+    const l = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
+    const c = BLUES[Math.min(3, l >> 6)];
+    d[p] = c[0]; d[p + 1] = c[1]; d[p + 2] = c[2];
+  }
+  tctx.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tmp, r.x, r.y, r.w, r.h);
+  ctx.imageSmoothingEnabled = true;
+}
+
+function drawDuo(r) {
+  const img = grab(r, Math.min(200, Math.max(8, Math.round(r.w / 2)))), d = img.data;
+  for (let p = 0; p < d.length; p += 4) {
+    let l = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
+    l = Math.max(0, Math.min(255, (l - 128) * 1.5 + 128)) / 255;
+    d[p] = 96 + l * 150; d[p + 1] = 12 + l * 185; d[p + 2] = 38 + l * 172;
+  }
+  tctx.putImageData(img, 0, 0);
+  ctx.drawImage(tmp, r.x, r.y, r.w, r.h);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+  ctx.fillStyle = "rgba(120,10,40,.85)";
+  ctx.font = `${r.w * 0.26}px ${DISPLAY}`;
+  ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+  ctx.fillText("HANDS", r.x + r.w / 2, r.y + r.h - r.h * 0.05, r.w * 0.94);
+  ctx.restore();
+}
+
+// Хар дэвсгэр дээрх эргэлдэх өнгөт цагиргууд
+function drawCard(r, t) {
+  ctx.fillStyle = "#050505"; ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2, R = Math.min(r.w, r.h) * 0.36;
+  const cols = ["#ff4d6d", "#ffb703", "#3ddc97", "#3a86ff", "#c77dff"];
+  ctx.lineCap = "round";
+  cols.forEach((c, i) => {
+    const rad = R * (1 - i * 0.17), a = t * (0.5 + i * 0.22) * (i % 2 ? -1 : 1);
+    ctx.strokeStyle = c; ctx.lineWidth = Math.max(2, R * 0.1);
+    ctx.beginPath(); ctx.arc(cx, cy, rad, a, a + Math.PI * 1.35); ctx.stroke();
+  });
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(cx, cy, R * 0.09, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+// Хар хүрээтэй, гарчигтай амьд камерын карт
+function drawPoster(r) {
+  const off = Math.min(r.w, r.h) * 0.06;
+  ctx.fillStyle = "#000"; ctx.fillRect(r.x + off, r.y - off, r.w, r.h);
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  const head = r.h * 0.2, m = r.w * 0.04;
+  ctx.drawImage(base, r.x, r.y, r.w, r.h, r.x + m, r.y + head, r.w - 2 * m, r.h - head - m);
+  ctx.fillStyle = "#ff3b3b";
+  ctx.font = `${head * 0.82}px ${DISPLAY}`;
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("LIVE NOW", r.x + m, r.y + head * 0.55, r.w - 2 * m);
+}
+
+function imageStyle(image, name) {
+  return { name, draw(r) {
+    const s = Math.max(r.w / image.width, r.h / image.height), sw = r.w / s, sh = r.h / s;
+    ctx.drawImage(image, (image.width - sw) / 2, (image.height - sh) / 2, sw, sh, r.x, r.y, r.w, r.h);
+  } };
+}
+
+const toPx = (l, W, H) => ({ x: l.x * W, y: l.y * H, w: l.w * W, h: l.h * H });
+function setNextLabel() { $("next").textContent = "Дараагийнх: " + STYLES[styleIdx].name; }
+
+let cur = null;               // одоо гарын хооронд байгаа хүрээ (0..1)
+let anchor = null, anchorAt = 0, armed = true;
+
+function place() {
+  if (!cur || cur.w < 0.08 || cur.h < 0.08) return;
+  layers.push({ style: STYLES[styleIdx], ...cur });
+  if (layers.length > 12) layers.shift();
+  styleIdx = (styleIdx + 1) % STYLES.length;
+  setNextLabel();
+  armed = false; anchor = { ...cur };
+}
+
+function fitCanvas() {
+  const vw = video.videoWidth, vh = video.videoHeight, key = vw + "x" + vh;
+  if (!vw || key === sizedFor) return;
+  sizedFor = key;
+  const k = Math.min(1, 960 / Math.max(vw, vh));
+  out.width = base.width = Math.round(vw * k); out.height = base.height = Math.round(vh * k);
+}
+
+function frame(now) {
+  if (!running) return;
+  requestAnimationFrame(frame);
+  if (video.readyState < 2 || video.currentTime === lastTime) return;
+  lastTime = video.currentTime;
+  fitCanvas();
+  const W = out.width, H = out.height, t = now / 1000;
+
+  let hands = [];
+  try { hands = landmarker.detectForVideo(video, now).landmarks || []; } catch (err) { /* кадр алгасна */ }
+
+  bctx.save();
+  if (mirror) { bctx.translate(W, 0); bctx.scale(-1, 1); }
+  bctx.drawImage(video, 0, 0, W, H);
+  bctx.restore();
+  ctx.drawImage(base, 0, 0);
+
+  for (const l of layers) l.style.draw(toPx(l, W, H), t);
+
+  if (hands.length >= 2) {
+    // Хоёр гарын долоовор хурууны үзүүр хүрээний эсрэг талын булангууд болно
+    const a = hands[0][8], b = hands[1][8], fx = v => mirror ? 1 - v : v;
+    const x0 = Math.min(fx(a.x), fx(b.x)), x1 = Math.max(fx(a.x), fx(b.x));
+    const y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y);
+    const target = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    if (!cur) cur = target;
+    else for (const k of ["x", "y", "w", "h"]) cur[k] += (target[k] - cur[k]) * 0.45;
+
+    const moved = anchor ? Math.max(Math.abs(cur.x - anchor.x), Math.abs(cur.y - anchor.y),
+      Math.abs(cur.x + cur.w - anchor.x - anchor.w), Math.abs(cur.y + cur.h - anchor.y - anchor.h)) : 1;
+    if (!armed) { if (moved > 0.12) { armed = true; anchor = { ...cur }; anchorAt = now; } }
+    else if (moved > 0.035) { anchor = { ...cur }; anchorAt = now; }
+
+    const r = toPx(cur, W, H), big = cur.w >= 0.08 && cur.h >= 0.08;
+    if (armed && big) {
+      ctx.save(); ctx.globalAlpha = 0.85; STYLES[styleIdx].draw(r, t); ctx.restore();
+    }
+    ctx.lineWidth = Math.max(1.5, W / 500); ctx.strokeStyle = "rgba(255,255,255,.95)";
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    if (armed && big) {
+      const hold = Math.min(1, (now - anchorAt) / 900);
+      ctx.fillStyle = "#fff"; ctx.fillRect(r.x, r.y + r.h + 4, r.w * hold, Math.max(3, W / 240));
+      if (hold >= 1) place();
+    }
+  } else { cur = null; anchor = null; armed = true; }
+
+  $("hint").style.display = hands.length >= 2 ? "none" : "block";
+  $("hint").textContent = "Хоёр гараа камерт харуул";
+}
+
+async function loadTracker() {
+  if (landmarker) return;
+  const { FilesetResolver, HandLandmarker } = await import(VISION);
+  const files = await FilesetResolver.forVisionTasks(WASM);
+  const make = delegate => HandLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: "VIDEO", numHands: 2,
+    minHandDetectionConfidence: 0.3, minHandPresenceConfidence: 0.3, minTrackingConfidence: 0.3 });
+  try { landmarker = await make("GPU"); } catch { landmarker = await make("CPU"); }
+}
+
+function stopStream() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.srcObject = null;
+}
+
+function camError(err) {
+  const n = err && err.name;
+  if (n === "NotAllowedError" || n === "SecurityError")
+    return "Камерын зөвшөөрөл өгөөгүй байна. Хөтчийн хаягийн мөрний цоожны тэмдэг дээр дараад Camera-г Allow болгоод дахин оролдоно уу.";
+  if (n === "NotFoundError" || n === "OverconstrainedError") return "Камер олдсонгүй.";
+  if (n === "NotReadableError") return "Камерыг өөр апп ашиглаж байна. Тэр аппыг хаагаад дахин оролдоно уу.";
+  return (err && err.message) || String(err);
+}
+
+async function openCam() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    throw new Error("Энэ хөтөч камер нээж чадахгүй байна. Линкийг Chrome эсвэл Safari-аар нээнэ үү.");
+  stopStream();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 960 }, height: { ideal: 720 } }, audio: false });
+  } catch (err) { throw new Error(camError(err)); }
+  mirror = facing === "user";
+  video.srcObject = stream;
+  await video.play();
+  sizedFor = "";
+}
+
+$("start").addEventListener("click", async () => {
+  const msg = $("msg");
+  $("start").disabled = true;
+  try {
+    msg.textContent = "Камер нээж байна…";
+    await openCam();
+    msg.textContent = "Гар таних загвар ачаалж байна…";
+    await loadTracker();
+    lastTime = -1;
+    $("panel").style.display = "none";
+    out.style.display = "block";
+    $("bar").style.display = "flex";
+    msg.textContent = "";
+    if (!running) { running = true; requestAnimationFrame(frame); }
+  } catch (err) {
+    stopStream();
+    msg.textContent = "Алдаа: " + (err.message || err);
+  } finally { $("start").disabled = false; }
+});
+
+$("next").addEventListener("click", () => { styleIdx = (styleIdx + 1) % STYLES.length; setNextLabel(); });
+$("place").addEventListener("click", place);
+$("undo").addEventListener("click", () => { layers.pop(); });
+$("clear").addEventListener("click", () => { layers.length = 0; });
+$("add").addEventListener("click", () => $("img").click());
+$("img").addEventListener("change", e => {
+  const f = e.target.files[0]; e.target.value = "";
+  if (!f) return;
+  const image = new Image();
+  image.onload = () => {
+    const n = STYLES.filter(s => s.name.startsWith("Зураг")).length + 1;
+    STYLES.push(imageStyle(image, "Зураг " + n));
+    styleIdx = STYLES.length - 1; setNextLabel();
+  };
+  image.src = URL.createObjectURL(f);
+});
+$("flip").addEventListener("click", async e => {
+  e.target.disabled = true;
+  const prev = facing;
+  facing = facing === "user" ? "environment" : "user";
+  try { await openCam(); }
+  catch (err) { facing = prev; try { await openCam(); } catch { /* камергүй үлдэнэ */ } }
+  e.target.disabled = false;
+});
+$("exit").addEventListener("click", () => {
+  running = false; stopStream();
+  out.style.display = "none";
+  $("bar").style.display = "none";
+  $("hint").style.display = "none";
+  $("panel").style.display = "flex";
+});
+</script>
+</body>
+</html>
