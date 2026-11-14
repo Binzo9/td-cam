@@ -256,7 +256,7 @@ function frame(now) {
   let pts = null;
   if (shapeIdx === 4) {
     if (hands.length >= 2) pts = orderQuad([hands[0][4], hands[0][8], hands[1][8], hands[1][4]].map(px));
-  } else if (tips.length) pts = hull(tips);
+  } else if (tips.length >= 3) pts = orderQuad(tips);   // бүх хурууны үзүүрийг дайрсан олон өнцөгт
 
   const together = hands.some(h => fingersTogether(h, px));
   if (together && !wasTogether && now - lastSwitch > 700) { nextFilter(); lastSwitch = now; }
