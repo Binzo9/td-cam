@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="mn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hand FX</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0a0d; color: #f2eef5;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { max-width: 100%; max-height: 100%; display: none; }
+  video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  #panel { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 16px;
+    align-items: center; justify-content: center; text-align: center; padding: 24px; }
+  #panel h1 { font-size: 22px; margin: 0; font-weight: 600; }
+  #panel p { margin: 0; max-width: 320px; line-height: 1.5; color: #b9b1c2; font-size: 15px; }
+  button { font: inherit; border: 0; border-radius: 999px; padding: 14px 28px; font-weight: 600;
+    background: #ff3d8b; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; }
+  button.ghost { background: transparent; border: 1px solid rgba(255,255,255,.35); }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: none; gap: 8px; flex-wrap: wrap;
+    justify-content: center; padding: 12px; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+  #bar button { padding: 10px 14px; font-size: 13px; background: rgba(20,18,24,.75);
+    border: 1px solid rgba(255,255,255,.25); }
+  #hint { position: fixed; top: max(14px, env(safe-area-inset-top)); left: 0; right: 0; text-align: center;
+    font-size: 14px; color: #fff; text-shadow: 0 1px 4px #000; display: none; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="out"></canvas></div>
+<video id="cam" playsinline muted autoplay></video>
+<input id="file" type="file" accept="video/*" hidden>
+
+<div id="panel">
+  <h1>Hand FX</h1>
+  <p>Камераа асаагаад хоёр гараа өргө. Эрхий, долоовор хурууны хооронд фильтрийн портал нээгдэнэ. Нэг гарынхаа хуруунуудыг нийлүүлэхэд фильтр солигдоно.</p>
+  <button id="start">Камер асаах</button>
+  <button id="pick" class="ghost">Бичлэг сонгох</button>
+  <p id="msg"></p>
+</div>
+<div id="hint">Гараа камерт харуул</div>
+<div id="bar">
+  <button id="style">Фильтр: Дулаан</button>
+  <button id="shape">Дүрс: Портал</button>
+  <button id="flip">Камер эргүүлэх</button>
+  <button id="dots">Цэгүүд: унтраалттай</button>
+  <button id="exit">✕ Гарах</button>
+</div>
+
+<script type="module">
+const VISION = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const $ = id => document.getElementById(id);
+const video = $("cam"), out = $("out"), ctx = out.getContext("2d");
+const fx = document.createElement("canvas");
+const fxCtx = fx.getContext("2d", { willReadFrequently: true });
+
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+const RAINBOW = { levels: 7, spin: 2.0, speed: 50, edge: [255, 240, 60] };
+let showDots = false, landmarker = null, lastTime = -1;
+let stream = null, facing = "user", mirror = true, fileUrl = null, running = false, sizedFor = "";
+
+function hslToRgb(h, s, l) {
+  h = ((h % 360) + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = l - c / 2;
+  const [r, g, b] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x]
+    : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+}
+
+const lut = new Uint8Array(256 * 3);
+function buildLut(t) {
+  const s = RAINBOW;
+  for (let i = 0; i < 256; i++) {
+    const band = Math.floor(i / 256 * s.levels);
+    const hue = band / s.levels * 360 * s.spin + t * s.speed;
+    const [r, g, b] = hslToRgb(hue, 1, band % 2 ? 0.55 : 0.45);
+    lut[i * 3] = r; lut[i * 3 + 1] = g; lut[i * 3 + 2] = b;
+  }
+}
+
+const FILTERS = ["Дулаан", "Нил ягаан", "Хар цагаан", "Негатив", "Пиксел", "Сепиа", "Зураас", "Солонго"];
+let filterIdx = 0;
+
+const jet = new Uint8Array(256 * 3);
+for (let i = 0; i < 256; i++) {
+  const v = i / 255, c = x => Math.max(0, Math.min(1, 1.5 - Math.abs(4 * v - x))) * 255;
+  jet[i * 3] = c(3); jet[i * 3 + 1] = c(2); jet[i * 3 + 2] = c(1);
+}
+
+// Видеог (урд камер бол толин тусгалаар) зурна
+function drawVideo(c, w, h) {
+  if (mirror) { c.save(); c.translate(w, 0); c.scale(-1, 1); c.drawImage(video, 0, 0, w, h); c.restore(); }
+  else c.drawImage(video, 0, 0, w, h);
+}
+
+function renderFx(t) {
+  const w = fx.width, h = fx.height, f = filterIdx;
+  drawVideo(fxCtx, w, h);
+  const img = fxCtx.getImageData(0, 0, w, h), d = img.data, n = w * h;
+  const lum = new Uint8Array(n);
+  for (let i = 0, p = 0; i < n; i++, p += 4)
+    lum[i] = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
+
+  if (f === 4) {
+    const B = 8;
+    for (let by = 0; by < h; by += B) for (let bx = 0; bx < w; bx += B) {
+      let r = 0, g = 0, b = 0, c = 0;
+      for (let y = by; y < Math.min(by + B, h); y++) for (let x = bx; x < Math.min(bx + B, w); x++) {
+        const p = (y * w + x) * 4; r += d[p]; g += d[p + 1]; b += d[p + 2]; c++;
+      }
+      r /= c; g /= c; b /= c;
+      for (let y = by; y < Math.min(by + B, h); y++) for (let x = bx; x < Math.min(bx + B, w); x++) {
+        const p = (y * w + x) * 4; d[p] = r; d[p + 1] = g; d[p + 2] = b;
+      }
+    }
+  } else {
+    if (f === 7) buildLut(t);
+    const e = RAINBOW.edge;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x, p = i * 4, l = lum[i];
+      let r, g, b;
+      if (f === 0) { r = jet[l * 3]; g = jet[l * 3 + 1]; b = jet[l * 3 + 2]; }
+      else if (f === 1) { r = 70 + l * 0.45; g = l * 0.12; b = 90 + l * 0.5; }
+      else if (f === 2) { r = g = b = l; }
+      else if (f === 3) { r = 255 - d[p]; g = 255 - d[p + 1]; b = 255 - d[p + 2]; }
+      else if (f === 5) { r = Math.min(255, l * 1.25 + 30); g = Math.min(255, l * 1.1 + 15); b = l * 0.75; }
+      else {
+        const gx = x + 1 < w ? Math.abs(l - lum[i + 1]) : 0, gy = y + 1 < h ? Math.abs(l - lum[i + w]) : 0;
+        if (f === 6) { r = g = b = Math.max(0, 255 - (gx + gy) * 9); }
+        else if (gx + gy > 28) { r = e[0]; g = e[1]; b = e[2]; }
+        else { r = lut[l * 3]; g = lut[l * 3 + 1]; b = lut[l * 3 + 2]; }
+      }
+      d[p] = r; d[p + 1] = g; d[p + 2] = b;
+    }
+  }
+  fxCtx.putImageData(img, 0, 0);
+}
+
+const TIPS = [4, 8, 12, 16, 20];
+
+function fingersTogether(lm, px) {
+  const tips = TIPS.map(k => px(lm[k]));
+  const cx = tips.reduce((a, p) => a + p.x, 0) / 5, cy = tips.reduce((a, p) => a + p.y, 0) / 5;
+  const w = px(lm[0]), m = px(lm[9]), size = Math.hypot(m.x - w.x, m.y - w.y);
+  return tips.every(p => Math.hypot(p.x - cx, p.y - cy) < size * 0.35);
+}
+let wasTogether = false, lastSwitch = 0;
+function nextFilter() {
+  filterIdx = (filterIdx + 1) % FILTERS.length;
+  $("style").textContent = "Фильтр: " + FILTERS[filterIdx];
+}
+
+function orderQuad(pts) {
+  const cx = pts.reduce((a, p) => a + p.x, 0) / pts.length;
+  const cy = pts.reduce((a, p) => a + p.y, 0) / pts.length;
+  return pts.slice().sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
+}
+
+function hull(points) {
+  const p = points.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const half = list => {
+    const h = [];
+    for (const q of list) {
+      while (h.length >= 2 && cross(h[h.length - 2], h[h.length - 1], q) <= 0) h.pop();
+      h.push(q);
+    }
+    h.pop();
+    return h;
+  };
+  return half(p).concat(half(p.reverse()));
+}
+
+const SHAPES = ["Олон өнцөгт", "Дугуй", "Од", "Зүрх", "Портал"];
+let shapeIdx = 4;
+
+function shapePath(tips, poly, wrists, middleTip) {
+  ctx.beginPath();
+  if (shapeIdx === 0 || shapeIdx === 4) {
+    poly.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    ctx.closePath();
+    return;
+  }
+  const cx = tips.reduce((a, p) => a + p.x, 0) / tips.length;
+  const cy = tips.reduce((a, p) => a + p.y, 0) / tips.length;
+  const r = Math.max(8, ...tips.map(p => Math.hypot(p.x - cx, p.y - cy)));
+  let rot;
+  if (middleTip) rot = Math.atan2(middleTip.y - wrists[0].y, middleTip.x - wrists[0].x) + Math.PI / 2;
+  else { rot = Math.atan2(wrists[1].y - wrists[0].y, wrists[1].x - wrists[0].x); if (Math.cos(rot) < 0) rot += Math.PI; }
+  const at = (x, y) => ({ x: cx + x * Math.cos(rot) - y * Math.sin(rot), y: cy + x * Math.sin(rot) + y * Math.cos(rot) });
+  if (shapeIdx === 1) { ctx.arc(cx, cy, r, 0, Math.PI * 2); return; }
+  const path = [];
+  if (shapeIdx === 2) {
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? r * 0.45 : r * 1.15;
+      path.push(at(Math.cos(a) * rr, Math.sin(a) * rr));
+    }
+  } else {
+    for (let i = 0; i < 60; i++) {
+      const t = i / 60 * Math.PI * 2, k = r / 15;
+      path.push(at(16 * Math.sin(t) ** 3 * k,
+        -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) * k));
+    }
+  }
+  path.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  ctx.closePath();
+}
+
+function drawHand(lm, px, W) {
+  ctx.lineWidth = Math.max(2, W / 320);
+  ctx.strokeStyle = "#ff2a2a";
+  ctx.beginPath();
+  for (const [a, b] of BONES) {
+    const p = px(lm[a]), q = px(lm[b]);
+    ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y);
+  }
+  ctx.stroke();
+  ctx.fillStyle = "#39ff5a";
+  const r = Math.max(3, W / 200);
+  for (const l of lm) {
+    const p = px(l);
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// Видеоны хэмжээ өөрчлөгдөхөд (утас эргүүлэх, камер солих) зургийн талбайг тааруулна
+function fitCanvas() {
+  const vw = video.videoWidth, vh = video.videoHeight, key = vw + "x" + vh;
+  if (!vw || key === sizedFor) return;
+  sizedFor = key;
+  const k = Math.min(1, 960 / Math.max(vw, vh));
+  out.width = Math.round(vw * k); out.height = Math.round(vh * k);
+  fx.width = 320; fx.height = Math.max(1, Math.round(320 * vh / vw));
+}
+
+function frame(now) {
+  if (!running) return;
+  requestAnimationFrame(frame);
+  if (video.readyState < 2 || video.currentTime === lastTime) return;
+  lastTime = video.currentTime;
+  fitCanvas();
+  const W = out.width, H = out.height;
+
+  let hands = [];
+  try { hands = landmarker.detectForVideo(video, now).landmarks || []; } catch (err) { /* кадр алгасна */ }
+
+  drawVideo(ctx, W, H);
+
+  const px = p => ({ x: (mirror ? 1 - p.x : p.x) * W, y: p.y * H });
+  const tips = hands.flatMap(h => TIPS.map(k => px(h[k])));
+  let pts = null;
+  if (shapeIdx === 4) {
+    if (hands.length >= 2) pts = orderQuad([hands[0][4], hands[0][8], hands[1][8], hands[1][4]].map(px));
+  } else if (tips.length) pts = hull(tips);
+
+  const together = hands.some(h => fingersTogether(h, px));
+  if (together && !wasTogether && now - lastSwitch > 700) { nextFilter(); lastSwitch = now; }
+  wasTogether = together;
+  if (pts) {
+    const wrists = hands.map(h => px(h[0])), mid = hands.length === 1 ? px(hands[0][12]) : null;
+    renderFx(now / 1000);
+    ctx.save();
+    shapePath(tips, pts, wrists, mid);
+    ctx.clip();
+    ctx.imageSmoothingEnabled = filterIdx !== 4;
+    ctx.drawImage(fx, 0, 0, W, H);
+    ctx.restore();
+    shapePath(tips, pts, wrists, mid);
+    ctx.lineWidth = Math.max(1.5, W / 500); ctx.strokeStyle = "rgba(255,255,255,.9)"; ctx.stroke();
+  }
+  if (showDots) for (const lm of hands) drawHand(lm, px, W);
+
+  $("hint").style.display = hands.length >= (shapeIdx === 4 ? 2 : 1) ? "none" : "block";
+  $("hint").textContent = shapeIdx === 4 ? "Хоёр гараа камерт харуул" : "Гараа камерт харуул";
+}
+
+async function loadTracker() {
+  if (landmarker) return;
+  const { FilesetResolver, HandLandmarker } = await import(VISION);
+  const files = await FilesetResolver.forVisionTasks(WASM);
+  const make = delegate => HandLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: "VIDEO", numHands: 2 });
+  try { landmarker = await make("GPU"); } catch { landmarker = await make("CPU"); }
+}
+
+function stopStream() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.srcObject = null;
+}
+
+function camError(err) {
+  const n = err && err.name;
+  if (n === "NotAllowedError" || n === "SecurityError")
+    return "Камерын зөвшөөрөл өгөөгүй байна. Хөтчийн хаягийн мөрний цоожны тэмдэг дээр дараад Camera-г Allow болгоод дахин оролдоно уу.";
+  if (n === "NotFoundError" || n === "OverconstrainedError") return "Камер олдсонгүй.";
+  if (n === "NotReadableError") return "Камерыг өөр апп ашиглаж байна. Тэр аппыг хаагаад дахин оролдоно уу.";
+  return (err && err.message) || String(err);
+}
+
+async function openCam() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    throw new Error("Энэ хөтөч камер нээж чадахгүй байна. Линкийг Chrome эсвэл Safari-аар нээнэ үү.");
+  stopStream();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 960 }, height: { ideal: 720 } }, audio: false });
+  } catch (err) { throw new Error(camError(err)); }
+  mirror = facing === "user";
+  video.removeAttribute("src");
+  video.loop = false;
+  video.srcObject = stream;
+  await video.play();
+}
+
+function show() {
+  sizedFor = ""; lastTime = -1;
+  $("panel").style.display = "none";
+  out.style.display = "block";
+  $("bar").style.display = "flex";
+  $("msg").textContent = "";
+  if (!running) { running = true; requestAnimationFrame(frame); }
+}
+
+async function begin(source) {
+  const msg = $("msg");
+  $("start").disabled = $("pick").disabled = true;
+  try {
+    // Камерыг эхэлж нээнэ — зөвшөөрлийн цонх товч дарсан даруйд гарна
+    msg.textContent = source ? "Бичлэг нээж байна…" : "Камер нээж байна…";
+    if (source) {
+      stopStream();
+      if (fileUrl) URL.revokeObjectURL(fileUrl);
+      fileUrl = URL.createObjectURL(source);
+      mirror = false; video.loop = true; video.src = fileUrl;
+      await new Promise((ok, bad) => {
+        video.onloadeddata = ok;
+        video.onerror = () => bad(new Error("Энэ бичлэгийг нээж чадсангүй. Өөр бичлэг оролдоно уу."));
+      });
+      try { await video.play(); } catch { /* дэлгэц дээр дарж тоглуулна */ }
+    } else await openCam();
+    $("flip").style.display = source ? "none" : "";
+    msg.textContent = "Гар таних загвар ачаалж байна…";
+    await loadTracker();
+    show();
+  } catch (err) {
+    stopStream();
+    msg.textContent = "Алдаа: " + (err.message || err);
+  } finally {
+    $("start").disabled = $("pick").disabled = false;
+  }
+}
+
+$("start").addEventListener("click", () => begin(null));
+$("pick").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", e => { const f = e.target.files[0]; e.target.value = ""; if (f) begin(f); });
+out.addEventListener("click", () => { if (!stream) video.paused ? video.play() : video.pause(); });
+
+$("flip").addEventListener("click", async e => {
+  e.target.disabled = true;
+  const prev = facing;
+  facing = facing === "user" ? "environment" : "user";
+  try { await openCam(); sizedFor = ""; }
+  catch (err) { facing = prev; try { await openCam(); } catch { /* камергүй үлдэнэ */ } }
+  e.target.disabled = false;
+});
+
+$("exit").addEventListener("click", () => {
+  running = false;
+  video.pause(); stopStream();
+  out.style.display = "none";
+  $("bar").style.display = "none";
+  $("hint").style.display = "none";
+  $("msg").textContent = "";
+  $("panel").style.display = "flex";
+});
+
+$("style").addEventListener("click", nextFilter);
+$("shape").addEventListener("click", e => {
+  shapeIdx = (shapeIdx + 1) % SHAPES.length;
+  e.target.textContent = "Дүрс: " + SHAPES[shapeIdx];
+});
+$("dots").addEventListener("click", e => {
+  showDots = !showDots;
+  e.target.textContent = "Цэгүүд: " + (showDots ? "асаалттай" : "унтраалттай");
+});
+</script>
+</body>
+</html>
